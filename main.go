@@ -2,18 +2,67 @@ package main
 
 import (
 	"crypto-exchange/orderbook"
+	"crypto/ecdsa"
 	"encoding/json"
 	"fmt"
+	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/labstack/echo/v4"
+	"log"
 	"net/http"
 	"strconv"
+)
 
-	"github.com/labstack/echo/v4"
+const (
+	MarketETH Market = "ETH"
+
+	MarketOrder OrderType = "MARKET"
+	LimitOrder  OrderType = "LIMIT"
+
+	exchangePrivateKey = "4f3edf983ac636a65a842ce7c78d9aa706d3b113bce9c46f30d7d21715b23b1d" // Ganache 0 id
+)
+
+type (
+	OrderType string
+	Market    string
+
+	PlaceOrderRequest struct {
+		Type   OrderType
+		Bid    bool
+		Size   float64
+		Price  float64
+		Market Market
+	}
+
+	Order struct {
+		ID        int64
+		Price     float64
+		Size      float64
+		Bid       bool
+		Timestamp int64
+	}
+
+	OrderbookData struct {
+		TotalBidVolume float64
+		TotalAskVolume float64
+		Asks           []*Order
+		Bids           []*Order
+	}
+
+	MatchedOrder struct {
+		Price float64
+		Size  float64
+		ID    int64
+	}
 )
 
 func main() {
 	e := echo.New()
 	e.HTTPErrorHandler = httpErrorHandler
-	ex := NewExchange()
+
+	ex, err := NewExchange(exchangePrivateKey)
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	e.GET("/book/:market", ex.handleGetBook)
 	e.POST("/order", ex.handlePlaceOrder)
@@ -26,52 +75,24 @@ func httpErrorHandler(err error, c echo.Context) {
 	fmt.Println(err)
 }
 
-type OrderType string
-
-const (
-	MarketOrder OrderType = "MARKET"
-	LimitOrder  OrderType = "LIMIT"
-)
-
-type Market string
-
-const (
-	MarketETH Market = "ETH"
-)
-
 type Exchange struct {
+	PrivateKey *ecdsa.PrivateKey
 	orderbooks map[Market]*orderbook.Orderbook
 }
 
-func NewExchange() *Exchange {
+func NewExchange(privateKey string) (*Exchange, error) {
 	orderbooks := make(map[Market]*orderbook.Orderbook)
 	orderbooks[MarketETH] = orderbook.NewOrderBook()
 
-	return &Exchange{
-		orderbooks: orderbooks,
+	pk, err := crypto.HexToECDSA(privateKey)
+	if err != nil {
+		return nil, err
 	}
-}
 
-type PlaceOrderRequest struct {
-	Type   OrderType
-	Bid    bool
-	Size   float64
-	Price  float64
-	Market Market
-}
-
-type Order struct {
-	ID        int64
-	Price     float64
-	Size      float64
-	Bid       bool
-	Timestamp int64
-}
-type OrderbookData struct {
-	TotalBidVolume float64
-	TotalAskVolume float64
-	Asks           []*Order
-	Bids           []*Order
+	return &Exchange{
+		PrivateKey: pk,
+		orderbooks: orderbooks,
+	}, nil
 }
 
 func (ex *Exchange) handleGetBook(c echo.Context) error {
@@ -127,12 +148,6 @@ func (ex *Exchange) cancelOrder(c echo.Context) error {
 	ob.CancelOrder(order)
 
 	return c.JSON(http.StatusOK, map[string]any{"msg": "order deleted"})
-}
-
-type MatchedOrder struct {
-	Price float64
-	Size  float64
-	ID    int64
 }
 
 func (ex *Exchange) handlePlaceOrder(c echo.Context) error {
