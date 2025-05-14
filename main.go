@@ -26,10 +26,6 @@ func httpErrorHandler(err error, c echo.Context) {
 	fmt.Println(err)
 }
 
-type Exchange struct {
-	orderbooks map[Market]*orderbook.Orderbook
-}
-
 type OrderType string
 
 const (
@@ -42,6 +38,10 @@ type Market string
 const (
 	MarketETH Market = "ETH"
 )
+
+type Exchange struct {
+	orderbooks map[Market]*orderbook.Orderbook
+}
 
 func NewExchange() *Exchange {
 	orderbooks := make(map[Market]*orderbook.Orderbook)
