@@ -1,15 +1,20 @@
 package main
 
 import (
+	"context"
 	"crypto-exchange/orderbook"
 	"crypto/ecdsa"
 	"encoding/json"
 	"fmt"
-	"github.com/ethereum/go-ethereum/crypto"
-	"github.com/labstack/echo/v4"
 	"log"
+	"math/big"
 	"net/http"
 	"strconv"
+
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/ethclient"
+	"github.com/labstack/echo/v4"
 )
 
 const (
@@ -26,6 +31,7 @@ type (
 	Market    string
 
 	PlaceOrderRequest struct {
+		UserID int64
 		Type   OrderType
 		Bid    bool
 		Size   float64
@@ -59,16 +65,54 @@ func main() {
 	e := echo.New()
 	e.HTTPErrorHandler = httpErrorHandler
 
-	ex, err := NewExchange(exchangePrivateKey)
+	client, err := ethclient.Dial("http://localhost:8545")
 	if err != nil {
 		log.Fatal(err)
 	}
+
+	ex, err := NewExchange(exchangePrivateKey, client)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	pkString := "829e924fdf021ba3dbbc4225edfece9aca04b929d6e75613329ca6f1d31c0bb4" // Ganache 8
+	pk, err := crypto.HexToECDSA(pkString)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	user := &User{
+		ID:         8,
+		PrivateKey: pk,
+	}
+	ex.Users[user.ID] = user
 
 	e.GET("/book/:market", ex.handleGetBook)
 	e.POST("/order", ex.handlePlaceOrder)
 	e.DELETE("/order/:id", ex.cancelOrder)
 
+	address := "0xACa94ef8bD5ffEE41947b4585a84BdA5a3d3DA6E"
+	balance, _ := ex.Client.BalanceAt(context.Background(), common.HexToAddress(address), nil)
+
+	fmt.Println(balance)
+
 	e.Start(":3000")
+}
+
+type User struct {
+	ID         int64
+	PrivateKey *ecdsa.PrivateKey
+}
+
+func NewUser(privateKey string) *User {
+	pk, err := crypto.HexToECDSA(privateKey)
+	if err != nil {
+		panic(err)
+	}
+
+	return &User{
+		PrivateKey: pk,
+	}
 }
 
 func httpErrorHandler(err error, c echo.Context) {
@@ -76,11 +120,14 @@ func httpErrorHandler(err error, c echo.Context) {
 }
 
 type Exchange struct {
+	Client     *ethclient.Client
+	Users      map[int64]*User
+	orders     map[int64]int64
 	PrivateKey *ecdsa.PrivateKey
 	orderbooks map[Market]*orderbook.Orderbook
 }
 
-func NewExchange(privateKey string) (*Exchange, error) {
+func NewExchange(privateKey string, client *ethclient.Client) (*Exchange, error) {
 	orderbooks := make(map[Market]*orderbook.Orderbook)
 	orderbooks[MarketETH] = orderbook.NewOrderBook()
 
@@ -90,6 +137,9 @@ func NewExchange(privateKey string) (*Exchange, error) {
 	}
 
 	return &Exchange{
+		Client:     client,
+		Users:      make(map[int64]*User),
+		orders:     make(map[int64]int64),
 		PrivateKey: pk,
 		orderbooks: orderbooks,
 	}, nil
@@ -150,6 +200,52 @@ func (ex *Exchange) cancelOrder(c echo.Context) error {
 	return c.JSON(http.StatusOK, map[string]any{"msg": "order deleted"})
 }
 
+func (ex *Exchange) handlePlaceMarketOrder(market Market, order *orderbook.Order) ([]orderbook.Match, []*MatchedOrder) {
+	ob := ex.orderbooks[market]
+	matches := ob.PlaceMarketOrder(order)
+	matchedOrders := make([]*MatchedOrder, len(matches))
+
+	isBid := false
+
+	if order.Bid {
+		isBid = true
+	}
+
+	for i := 0; i < len(matchedOrders); i++ {
+		id := matches[i].Bid.ID
+		if isBid {
+			id = matches[i].Ask.ID
+		}
+		matchedOrders[i] = &MatchedOrder{
+			ID:    id,
+			Size:  matches[i].SizeFilled,
+			Price: matches[i].Price,
+		}
+	}
+
+	return matches, matchedOrders
+}
+
+func (ex *Exchange) handlePlaceLimitOrder(market Market, price float64, order *orderbook.Order) error {
+	ob := ex.orderbooks[market]
+	ob.PlaceLimitOrder(price, order)
+
+	user, ok := ex.Users[order.UserID]
+	if !ok {
+		return fmt.Errorf("user not found: %d", user.ID)
+	}
+
+	exchangePubKey := ex.PrivateKey.Public()
+	plubicKeyECDSA, ok := exchangePubKey.(*ecdsa.PublicKey)
+	if !ok {
+		return fmt.Errorf("error casting public key to ecdsa")
+	}
+	toAddress := crypto.PubkeyToAddress(*plubicKeyECDSA)
+	amount := big.NewInt(int64(order.Size))
+
+	return transferETH(ex.Client, user.PrivateKey, toAddress, amount)
+}
+
 func (ex *Exchange) handlePlaceOrder(c echo.Context) error {
 	var placeOrderData PlaceOrderRequest
 
@@ -158,38 +254,26 @@ func (ex *Exchange) handlePlaceOrder(c echo.Context) error {
 	}
 
 	market := Market(placeOrderData.Market)
-	ob := ex.orderbooks[market]
-	order := orderbook.NewOrder(placeOrderData.Bid, placeOrderData.Size)
+	order := orderbook.NewOrder(placeOrderData.Bid, placeOrderData.Size, placeOrderData.UserID)
 
 	if placeOrderData.Type == LimitOrder {
-		ob.PlaceLimitOrder(placeOrderData.Price, order)
-		return c.JSON(200, map[string]any{"msg": "limit order placed"})
+		if err := ex.handlePlaceLimitOrder(market, placeOrderData.Price, order); err != nil {
+			return err
+		}
+		return c.JSON(http.StatusOK, map[string]any{"msg": "limit order placed"})
 	}
 
 	if placeOrderData.Type == MarketOrder {
-		matches := ob.PlaceMarketOrder(order)
-		matchedOrders := make([]*MatchedOrder, len(matches))
-
-		isBid := false
-
-		if order.Bid {
-			isBid = true
+		matches, matchedOrders := ex.handlePlaceMarketOrder(market, order)
+		if err := ex.handleMatches(matches); err != nil {
+			return err
 		}
-
-		for i := 0; i < len(matchedOrders); i++ {
-			id := matches[i].Bid.ID
-			if isBid {
-				id = matches[i].Ask.ID
-			}
-			matchedOrders[i] = &MatchedOrder{
-				ID:    id,
-				Size:  matches[i].SizeFilled,
-				Price: matches[i].Price,
-			}
-		}
-
-		return c.JSON(200, map[string]any{"matches": matchedOrders})
+		return c.JSON(http.StatusOK, map[string]any{"matches": matchedOrders})
 	}
 
+	return nil
+}
+
+func (ex *Exchange) handleMatches(matches []orderbook.Match) error {
 	return nil
 }
