@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"crypto-exchange/orderbook"
 	"crypto/ecdsa"
 	"encoding/json"
@@ -11,7 +10,6 @@ import (
 	"net/http"
 	"strconv"
 
-	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/labstack/echo/v4"
@@ -40,6 +38,7 @@ type (
 	}
 
 	Order struct {
+		UserId    int64
 		ID        int64
 		Price     float64
 		Size      float64
@@ -75,26 +74,21 @@ func main() {
 		log.Fatal(err)
 	}
 
-	pkString := "829e924fdf021ba3dbbc4225edfece9aca04b929d6e75613329ca6f1d31c0bb4" // Ganache 8
-	pk, err := crypto.HexToECDSA(pkString)
-	if err != nil {
-		log.Fatal(err)
-	}
+	pkStr7 := "a453611d9419d0e56f499079478fd72c37b251a94bfde4d19872c44cf65386e3"
+	user7 := NewUser(pkStr7, 7)
+	ex.Users[user7.ID] = user7
 
-	user := &User{
-		ID:         8,
-		PrivateKey: pk,
-	}
-	ex.Users[user.ID] = user
+	pkStr8 := "829e924fdf021ba3dbbc4225edfece9aca04b929d6e75613329ca6f1d31c0bb4" // Ganache 8
+	user8 := NewUser(pkStr8, 8)
+	ex.Users[user8.ID] = user8
+
+	jhonPk := "e485d098507f54e7733a205420dfddbe58db035fa577fc294ebd14db90767a52"
+	jhon := NewUser(jhonPk, 666)
+	ex.Users[jhon.ID] = jhon
 
 	e.GET("/book/:market", ex.handleGetBook)
 	e.POST("/order", ex.handlePlaceOrder)
 	e.DELETE("/order/:id", ex.cancelOrder)
-
-	address := "0xACa94ef8bD5ffEE41947b4585a84BdA5a3d3DA6E"
-	balance, _ := ex.Client.BalanceAt(context.Background(), common.HexToAddress(address), nil)
-
-	fmt.Println(balance)
 
 	e.Start(":3000")
 }
@@ -104,13 +98,14 @@ type User struct {
 	PrivateKey *ecdsa.PrivateKey
 }
 
-func NewUser(privateKey string) *User {
+func NewUser(privateKey string, id int64) *User {
 	pk, err := crypto.HexToECDSA(privateKey)
 	if err != nil {
 		panic(err)
 	}
 
 	return &User{
+		ID:         id,
 		PrivateKey: pk,
 	}
 }
@@ -163,6 +158,7 @@ func (ex *Exchange) handleGetBook(c echo.Context) error {
 	for _, limit := range ob.Asks() {
 		for _, order := range limit.Orders {
 			o := Order{
+				UserId:    order.UserID,
 				ID:        order.ID,
 				Price:     limit.Price,
 				Size:      order.Size,
@@ -176,6 +172,7 @@ func (ex *Exchange) handleGetBook(c echo.Context) error {
 	for _, limit := range ob.Bids() {
 		for _, order := range limit.Orders {
 			o := Order{
+				UserId:    order.UserID,
 				ID:        order.ID,
 				Price:     limit.Price,
 				Size:      order.Size,
@@ -230,20 +227,7 @@ func (ex *Exchange) handlePlaceLimitOrder(market Market, price float64, order *o
 	ob := ex.orderbooks[market]
 	ob.PlaceLimitOrder(price, order)
 
-	user, ok := ex.Users[order.UserID]
-	if !ok {
-		return fmt.Errorf("user not found: %d", user.ID)
-	}
-
-	exchangePubKey := ex.PrivateKey.Public()
-	plubicKeyECDSA, ok := exchangePubKey.(*ecdsa.PublicKey)
-	if !ok {
-		return fmt.Errorf("error casting public key to ecdsa")
-	}
-	toAddress := crypto.PubkeyToAddress(*plubicKeyECDSA)
-	amount := big.NewInt(int64(order.Size))
-
-	return transferETH(ex.Client, user.PrivateKey, toAddress, amount)
+	return nil
 }
 
 func (ex *Exchange) handlePlaceOrder(c echo.Context) error {
@@ -275,5 +259,28 @@ func (ex *Exchange) handlePlaceOrder(c echo.Context) error {
 }
 
 func (ex *Exchange) handleMatches(matches []orderbook.Match) error {
+	for _, match := range matches {
+		fromUser, ok := ex.Users[match.Ask.UserID]
+		if !ok {
+			return fmt.Errorf("user not found: %d", match.Ask.UserID)
+		}
+
+		toUser, ok := ex.Users[match.Bid.UserID]
+		if !ok {
+			return fmt.Errorf("user not found: %d", match.Bid.UserID)
+		}
+
+		toAddress := crypto.PubkeyToAddress(toUser.PrivateKey.PublicKey)
+
+		// Only used to exchange fees
+		// exchangePubKey := ex.PrivateKey.Public()
+		// plubicKeyECDSA, ok := exchangePubKey.(*ecdsa.PublicKey)
+		// if !ok {
+		// 	return fmt.Errorf("error casting public key to ecdsa")
+		// }
+
+		amount := big.NewInt(int64(match.SizeFilled))
+		transferETH(ex.Client, fromUser.PrivateKey, toAddress, amount)
+	}
 	return nil
 }
